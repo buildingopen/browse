@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+import os; os.environ["NODE_NO_WARNINGS"] = "1"
+"""browse - Browser CLI with autonomous agent mode.
+Connects to existing Chrome via CDP or launches headless Chromium.
+
+Usage:
+  browse open <url>           Navigate to URL
+  browse state                Show clickable elements with indices
+  browse click <index>        Click element by index
+  browse type <text>          Type text into focused element
+  browse input <index> <text> Clear field and type into specific element
+  browse screenshot [file]    Take screenshot
+  browse extract              Extract page text
+  browse task "<goal>"        Autonomous agent: complete a task using AI
+  browse close                Close browser
+"""
+import sys, json, tempfile, base64, re
+
+CDP_URL = os.environ.get("BROWSE_CDP_URL", "http://localhost:9222")
+STATE_FILE = os.path.join(tempfile.gettempdir(), f"browse-state-{os.getuid()}.json")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
+
+def get_state_file():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_state(data):
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f)
+
+def get_browser():
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.connect_over_cdp(CDP_URL)
+        mode = "cdp"
+    except Exception:
+        browser = pw.chromium.launch(headless=True)
+        mode = "chromium"
+
+    if browser.contexts:
+        ctx = browser.contexts[0]
+        if ctx.pages:
+            page = ctx.pages[-1]
+        else:
+            page = ctx.new_page()
+    else:
+        ctx = browser.new_context()
+        page = ctx.new_page()
+
+    return pw, browser, page, mode
+
+def get_elements(page):
+    return page.evaluate("""() => {
+        const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+        return Array.from(els).map((el, i) => {
+            const tag = el.tagName.toLowerCase();
+            const text = (el.textContent || '').trim().slice(0, 80);
+            const type = el.getAttribute('type') || '';
+            const href = el.getAttribute('href') || '';
+            const placeholder = el.getAttribute('placeholder') || '';
+            const value = el.value || '';
+            const label = text || placeholder || value || href || type;
+            return `[${i}]<${tag}${type ? ' type=' + type : ''}> ${label}`;
+        });
+    }""")
+
+def cmd_open(url):
+    pw, browser, page, mode = get_browser()
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    save_state({"url": url, "mode": mode})
+    print(f"mode: {mode}")
+    print(f"url: {page.url}")
+    print(f"title: {page.title()}")
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def cmd_state():
+    pw, browser, page, mode = get_browser()
+    elements = get_elements(page)
+    print(f"url: {page.url}")
+    print(f"title: {page.title()}")
+    print(f"elements: {len(elements)}")
+    print()
+    for el in elements:
+        print(el)
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def cmd_click(index):
+    pw, browser, page, mode = get_browser()
+    page.evaluate(f"""() => {{
+        const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+        if (els[{index}]) els[{index}].click();
+    }}""")
+    page.wait_for_timeout(1000)
+    print(f"clicked: {index}")
+    print(f"url: {page.url}")
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def cmd_input(index, text):
+    pw, browser, page, mode = get_browser()
+    page.evaluate(f"""() => {{
+        const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+        const el = els[{index}];
+        if (el) {{ el.focus(); el.value = ''; }}
+    }}""")
+    page.keyboard.type(text)
+    print(f"input [{index}]: {text}")
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def cmd_type(text):
+    pw, browser, page, mode = get_browser()
+    page.keyboard.type(text)
+    print(f"typed: {text}")
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def cmd_screenshot(path=None):
+    pw, browser, page, mode = get_browser()
+    if not path:
+        path = os.path.join(tempfile.gettempdir(), "browse-screenshot.png")
+    page.screenshot(path=path, full_page=True, timeout=10000)
+    print(f"saved: {path}")
+    print(f"size: {os.path.getsize(path)}")
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def cmd_extract():
+    pw, browser, page, mode = get_browser()
+    print(page.evaluate("() => document.body.innerText"))
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def cmd_close():
+    pw, browser, page, mode = get_browser()
+    if mode != "cdp": browser.close()
+    if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
+    print("closed")
+    pw.stop()
+
+# --- Autonomous Agent ---
+
+def call_gemini(prompt, screenshot_b64=None):
+    import urllib.request
+    if not GEMINI_KEY:
+        print("Error: set GEMINI_API_KEY or GOOGLE_API_KEY", file=sys.stderr)
+        sys.exit(1)
+
+    parts = [{"text": prompt}]
+    if screenshot_b64:
+        parts.append({"inline_data": {"mime_type": "image/png", "data": screenshot_b64}})
+
+    body = json.dumps({
+        "contents": [{"parts": parts}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 1024}
+    }).encode()
+
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
+
+    return result["candidates"][0]["content"]["parts"][0]["text"]
+
+def cmd_task(goal, max_steps=30):
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.connect_over_cdp(CDP_URL)
+        mode = "cdp"
+    except Exception:
+        browser = pw.chromium.launch(headless=True)
+        mode = "chromium"
+
+    if browser.contexts:
+        ctx = browser.contexts[0]
+        page = ctx.pages[-1] if ctx.pages else ctx.new_page()
+    else:
+        ctx = browser.new_context()
+        page = ctx.new_page()
+
+    print(f"mode: {mode}")
+    print(f"task: {goal}")
+    print(f"max_steps: {max_steps}")
+    print()
+
+    history = []
+
+    for step in range(1, max_steps + 1):
+        # Get page state
+        elements = get_elements(page)
+        url = page.url
+        title = page.title()
+        text_content = page.evaluate("() => document.body.innerText").strip()[:2000]
+
+        # Take screenshot
+        shot_path = os.path.join(tempfile.gettempdir(), "browse-agent-shot.png")
+        try:
+            page.screenshot(path=shot_path, timeout=10000)
+            with open(shot_path, "rb") as f:
+                shot_b64 = base64.b64encode(f.read()).decode()
+        except Exception:
+            shot_b64 = None
+
+        state_text = f"URL: {url}\nTitle: {title}\n\nElements:\n" + "\n".join(elements[:50])
+        if text_content:
+            state_text += f"\n\nPage text (first 2000 chars):\n{text_content}"
+
+        history_text = "\n".join(history[-10:]) if history else "No actions yet."
+
+        prompt = f"""You are a browser automation agent. Complete this task: {goal}
+
+Current page state:
+{state_text}
+
+Action history:
+{history_text}
+
+Respond with exactly ONE action in this format:
+ACTION: <action_type> <params>
+
+Available actions:
+- ACTION: click <index>          (click element by index from Elements list)
+- ACTION: input <index> <text>   (clear field at index and type text)
+- ACTION: navigate <url>         (go to URL)
+- ACTION: scroll down             (scroll down)
+- ACTION: scroll up               (scroll up)
+- ACTION: wait                    (wait 2 seconds for page to load)
+- ACTION: done <result>           (task complete, explain what was accomplished)
+- ACTION: fail <reason>           (task cannot be completed, explain why)
+
+Rules:
+- Use element indices from the Elements list above
+- For forms: input into the field first, then click the submit button
+- One action per response, no explanation, just the ACTION line"""
+
+        print(f"[step {step}] thinking...", end=" ", flush=True)
+        try:
+            response = call_gemini(prompt, shot_b64)
+        except Exception as e:
+            print(f"LLM error: {e}")
+            break
+
+        # Parse action
+        action_match = re.search(r'ACTION:\s*(.+)', response.strip())
+        if not action_match:
+            print(f"no action parsed from: {response[:100]}")
+            history.append(f"Step {step}: failed to parse action")
+            continue
+
+        action_line = action_match.group(1).strip()
+        print(action_line)
+
+        try:
+            if action_line.startswith("click "):
+                idx = int(action_line.split()[1])
+                page.evaluate(f"""() => {{
+                    const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+                    if (els[{idx}]) els[{idx}].click();
+                }}""")
+                page.wait_for_timeout(1500)
+                history.append(f"Step {step}: clicked [{idx}]")
+
+            elif action_line.startswith("input "):
+                parts = action_line.split(maxsplit=2)
+                idx = int(parts[1])
+                text = parts[2] if len(parts) > 2 else ""
+                page.evaluate(f"""() => {{
+                    const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+                    const el = els[{idx}];
+                    if (el) {{ el.focus(); el.value = ''; }}
+                }}""")
+                page.keyboard.type(text)
+                page.wait_for_timeout(500)
+                history.append(f"Step {step}: input [{idx}] '{text}'")
+
+            elif action_line.startswith("navigate "):
+                url = action_line.split(maxsplit=1)[1]
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1000)
+                history.append(f"Step {step}: navigated to {url}")
+
+            elif action_line.startswith("scroll "):
+                direction = action_line.split()[1]
+                page.evaluate(f"window.scrollBy(0, {'500' if direction == 'down' else '-500'})")
+                page.wait_for_timeout(500)
+                history.append(f"Step {step}: scrolled {direction}")
+
+            elif action_line.startswith("wait"):
+                page.wait_for_timeout(2000)
+                history.append(f"Step {step}: waited")
+
+            elif action_line.startswith("done"):
+                result = action_line[5:].strip() if len(action_line) > 5 else "completed"
+                print(f"\nTask complete: {result}")
+                break
+
+            elif action_line.startswith("fail"):
+                reason = action_line[5:].strip() if len(action_line) > 5 else "unknown"
+                print(f"\nTask failed: {reason}")
+                break
+
+            else:
+                print(f"  unknown action: {action_line}")
+                history.append(f"Step {step}: unknown action")
+
+        except Exception as e:
+            print(f"  action error: {e}")
+            history.append(f"Step {step}: error - {e}")
+
+    else:
+        print(f"\nMax steps ({max_steps}) reached.")
+
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h"):
+        print(__doc__)
+        sys.exit(0)
+    if sys.argv[1] == "--version":
+        print("browse 2.0.0")
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    try:
+        if cmd == "open" and len(sys.argv) > 2:
+            cmd_open(sys.argv[2])
+        elif cmd == "state":
+            cmd_state()
+        elif cmd == "click" and len(sys.argv) > 2:
+            cmd_click(int(sys.argv[2]))
+        elif cmd == "input" and len(sys.argv) > 3:
+            cmd_input(int(sys.argv[2]), " ".join(sys.argv[3:]))
+        elif cmd == "type" and len(sys.argv) > 2:
+            cmd_type(" ".join(sys.argv[2:]))
+        elif cmd == "screenshot":
+            cmd_screenshot(sys.argv[2] if len(sys.argv) > 2 else None)
+        elif cmd == "extract":
+            cmd_extract()
+        elif cmd == "task" and len(sys.argv) > 2:
+            max_steps = 30
+            if "--max-steps" in sys.argv:
+                idx = sys.argv.index("--max-steps")
+                max_steps = int(sys.argv[idx + 1])
+                sys.argv.pop(idx); sys.argv.pop(idx)
+            cmd_task(" ".join(sys.argv[2:]), max_steps)
+        elif cmd == "close":
+            cmd_close()
+        else:
+            print(f"Unknown command: {cmd}", file=sys.stderr)
+            print(__doc__)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
