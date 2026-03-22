@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 import os; os.environ["NODE_NO_WARNINGS"] = "1"
-"""browse - Browser CLI with autonomous agent mode.
+"""browse - Browser automation CLI with autonomous agent mode.
 Connects to existing Chrome via CDP or launches headless Chromium.
 
 Usage:
-  browse open <url>           Navigate to URL
-  browse state                Show clickable elements with indices
-  browse click <index>        Click element by index
-  browse type <text>          Type text into focused element
-  browse input <index> <text> Clear field and type into specific element
-  browse screenshot [file]    Take screenshot
-  browse extract              Extract page text
-  browse task "<goal>"        Autonomous agent: complete a task using AI
-  browse close                Close browser
+  browse open <url>              Navigate to URL
+  browse state                   Show clickable elements with indices
+  browse click <index>           Click element by index
+  browse input <index> <text>    Clear field and type into specific element
+  browse type <text>             Type into focused element
+  browse select <index> <value>  Select dropdown option
+  browse screenshot [file]       Take screenshot
+  browse extract                 Extract page text
+  browse tabs                    List open tabs
+  browse tab <index>             Switch to tab by index
+  browse newtab <url>            Open URL in new tab
+  browse closetab [index]        Close tab (default: current)
+  browse cookies save [file]     Save cookies to file
+  browse cookies load [file]     Load cookies from file
+  browse solve                   Solve CAPTCHA on current page (needs 2CAPTCHA_KEY)
+  browse task "<goal>"           Autonomous agent: AI completes the task
+  browse close                   Close browser
 """
-import sys, json, tempfile, base64, re
+import sys, json, tempfile, base64, re, time
 
 CDP_URL = os.environ.get("BROWSE_CDP_URL", "http://localhost:9222")
 STATE_FILE = os.path.join(tempfile.gettempdir(), f"browse-state-{os.getuid()}.json")
+COOKIE_FILE = os.path.join(tempfile.gettempdir(), f"browse-cookies-{os.getuid()}.json")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
-
-def get_state_file():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {}
+CAPTCHA_KEY = os.environ.get("TWOCAPTCHA_KEY", os.environ.get("2CAPTCHA_KEY", ""))
 
 def save_state(data):
     with open(STATE_FILE, "w") as f:
@@ -42,19 +46,22 @@ def get_browser():
 
     if browser.contexts:
         ctx = browser.contexts[0]
-        if ctx.pages:
-            page = ctx.pages[-1]
-        else:
-            page = ctx.new_page()
+        page = ctx.pages[-1] if ctx.pages else ctx.new_page()
     else:
         ctx = browser.new_context()
         page = ctx.new_page()
 
-    return pw, browser, page, mode
+    return pw, browser, ctx, page, mode
+
+def cleanup(pw, browser, mode):
+    if mode != "cdp": browser.close()
+    pw.stop()
+
+ELEMENT_SELECTOR = 'a, button, input, select, textarea, [role="button"], [onclick], [tabindex]'
 
 def get_elements(page):
     return page.evaluate("""() => {
-        const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+        const els = document.querySelectorAll('""" + ELEMENT_SELECTOR + """');
         return Array.from(els).map((el, i) => {
             const tag = el.tagName.toLowerCase();
             const text = (el.textContent || '').trim().slice(0, 80);
@@ -62,86 +69,252 @@ def get_elements(page):
             const href = el.getAttribute('href') || '';
             const placeholder = el.getAttribute('placeholder') || '';
             const value = el.value || '';
-            const label = text || placeholder || value || href || type;
-            return `[${i}]<${tag}${type ? ' type=' + type : ''}> ${label}`;
+            const name = el.getAttribute('name') || '';
+            const label = text || placeholder || value || href || name || type;
+            return `[${i}]<${tag}${type ? ' type=' + type : ''}${name ? ' name=' + name : ''}> ${label}`;
         });
     }""")
 
+def with_retry(fn, retries=2, delay=1):
+    for i in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if i == retries:
+                raise
+            print(f"  retry {i+1}/{retries}: {e}", file=sys.stderr)
+            time.sleep(delay)
+
+# --- Basic Commands ---
+
 def cmd_open(url):
-    pw, browser, page, mode = get_browser()
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    pw, browser, ctx, page, mode = get_browser()
+    with_retry(lambda: page.goto(url, wait_until="domcontentloaded", timeout=30000))
     save_state({"url": url, "mode": mode})
     print(f"mode: {mode}")
     print(f"url: {page.url}")
     print(f"title: {page.title()}")
-    if mode != "cdp": browser.close()
-    pw.stop()
+    cleanup(pw, browser, mode)
 
 def cmd_state():
-    pw, browser, page, mode = get_browser()
+    pw, browser, ctx, page, mode = get_browser()
     elements = get_elements(page)
     print(f"url: {page.url}")
     print(f"title: {page.title()}")
+    print(f"tabs: {len(ctx.pages)}")
     print(f"elements: {len(elements)}")
     print()
     for el in elements:
         print(el)
-    if mode != "cdp": browser.close()
-    pw.stop()
+    cleanup(pw, browser, mode)
 
 def cmd_click(index):
-    pw, browser, page, mode = get_browser()
+    pw, browser, ctx, page, mode = get_browser()
     page.evaluate(f"""() => {{
-        const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+        const els = document.querySelectorAll('{ELEMENT_SELECTOR}');
         if (els[{index}]) els[{index}].click();
     }}""")
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(1500)
     print(f"clicked: {index}")
     print(f"url: {page.url}")
-    if mode != "cdp": browser.close()
-    pw.stop()
+    cleanup(pw, browser, mode)
 
 def cmd_input(index, text):
-    pw, browser, page, mode = get_browser()
+    pw, browser, ctx, page, mode = get_browser()
     page.evaluate(f"""() => {{
-        const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+        const els = document.querySelectorAll('{ELEMENT_SELECTOR}');
         const el = els[{index}];
         if (el) {{ el.focus(); el.value = ''; }}
     }}""")
     page.keyboard.type(text)
     print(f"input [{index}]: {text}")
-    if mode != "cdp": browser.close()
-    pw.stop()
+    cleanup(pw, browser, mode)
+
+def cmd_select(index, value):
+    pw, browser, ctx, page, mode = get_browser()
+    page.evaluate(f"""() => {{
+        const els = document.querySelectorAll('{ELEMENT_SELECTOR}');
+        const el = els[{index}];
+        if (el && el.tagName === 'SELECT') {{
+            el.value = '{value}';
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        }}
+    }}""")
+    print(f"selected [{index}]: {value}")
+    cleanup(pw, browser, mode)
 
 def cmd_type(text):
-    pw, browser, page, mode = get_browser()
+    pw, browser, ctx, page, mode = get_browser()
     page.keyboard.type(text)
     print(f"typed: {text}")
-    if mode != "cdp": browser.close()
-    pw.stop()
+    cleanup(pw, browser, mode)
 
 def cmd_screenshot(path=None):
-    pw, browser, page, mode = get_browser()
+    pw, browser, ctx, page, mode = get_browser()
     if not path:
         path = os.path.join(tempfile.gettempdir(), "browse-screenshot.png")
     page.screenshot(path=path, full_page=True, timeout=10000)
     print(f"saved: {path}")
     print(f"size: {os.path.getsize(path)}")
-    if mode != "cdp": browser.close()
-    pw.stop()
+    cleanup(pw, browser, mode)
 
 def cmd_extract():
-    pw, browser, page, mode = get_browser()
+    pw, browser, ctx, page, mode = get_browser()
     print(page.evaluate("() => document.body.innerText"))
-    if mode != "cdp": browser.close()
-    pw.stop()
+    cleanup(pw, browser, mode)
 
 def cmd_close():
-    pw, browser, page, mode = get_browser()
+    pw, browser, ctx, page, mode = get_browser()
     if mode != "cdp": browser.close()
-    if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
+    for f in [STATE_FILE, COOKIE_FILE]:
+        if os.path.exists(f): os.remove(f)
     print("closed")
     pw.stop()
+
+# --- Tab Management ---
+
+def cmd_tabs():
+    pw, browser, ctx, page, mode = get_browser()
+    for i, p in enumerate(ctx.pages):
+        marker = " *" if p == page else ""
+        print(f"[{i}] {p.url}{marker}")
+    cleanup(pw, browser, mode)
+
+def cmd_tab(index):
+    pw, browser, ctx, page, mode = get_browser()
+    if index < len(ctx.pages):
+        target = ctx.pages[index]
+        target.bring_to_front()
+        print(f"switched to [{index}]: {target.url}")
+    else:
+        print(f"Error: tab {index} not found ({len(ctx.pages)} tabs open)", file=sys.stderr)
+    cleanup(pw, browser, mode)
+
+def cmd_newtab(url):
+    pw, browser, ctx, page, mode = get_browser()
+    new_page = ctx.new_page()
+    with_retry(lambda: new_page.goto(url, wait_until="domcontentloaded", timeout=30000))
+    print(f"new tab [{len(ctx.pages)-1}]: {new_page.url}")
+    cleanup(pw, browser, mode)
+
+def cmd_closetab(index=None):
+    pw, browser, ctx, page, mode = get_browser()
+    if index is not None and index < len(ctx.pages):
+        target = ctx.pages[index]
+    else:
+        target = page
+    url = target.url
+    target.close()
+    print(f"closed tab: {url}")
+    cleanup(pw, browser, mode)
+
+# --- Cookie Persistence ---
+
+def cmd_cookies_save(path=None):
+    pw, browser, ctx, page, mode = get_browser()
+    cookies = ctx.cookies()
+    path = path or COOKIE_FILE
+    with open(path, "w") as f:
+        json.dump(cookies, f, indent=2)
+    print(f"saved {len(cookies)} cookies to {path}")
+    cleanup(pw, browser, mode)
+
+def cmd_cookies_load(path=None):
+    pw, browser, ctx, page, mode = get_browser()
+    path = path or COOKIE_FILE
+    if not os.path.exists(path):
+        print(f"Error: {path} not found", file=sys.stderr)
+        cleanup(pw, browser, mode)
+        return
+    with open(path) as f:
+        cookies = json.load(f)
+    ctx.add_cookies(cookies)
+    print(f"loaded {len(cookies)} cookies from {path}")
+    cleanup(pw, browser, mode)
+
+# --- CAPTCHA Solving ---
+
+def cmd_solve():
+    if not CAPTCHA_KEY:
+        print("Error: set TWOCAPTCHA_KEY or 2CAPTCHA_KEY", file=sys.stderr)
+        sys.exit(1)
+
+    import urllib.request
+    pw, browser, ctx, page, mode = get_browser()
+
+    # Check for reCAPTCHA
+    sitekey = page.evaluate("""() => {
+        const el = document.querySelector('[data-sitekey]');
+        return el ? el.getAttribute('data-sitekey') : null;
+    }""")
+
+    if not sitekey:
+        # Check for hCaptcha
+        sitekey = page.evaluate("""() => {
+            const el = document.querySelector('[data-sitekey], .h-captcha[data-sitekey]');
+            return el ? el.getAttribute('data-sitekey') : null;
+        }""")
+
+    if not sitekey:
+        print("No CAPTCHA found on page (no data-sitekey element)")
+        cleanup(pw, browser, mode)
+        return
+
+    print(f"Found CAPTCHA sitekey: {sitekey[:20]}...")
+    print("Submitting to 2captcha...")
+
+    # Submit to 2captcha
+    url = page.url
+    submit_url = f"http://2captcha.com/in.php?key={CAPTCHA_KEY}&method=userrecaptcha&googlekey={sitekey}&pageurl={url}&json=1"
+    with urllib.request.urlopen(submit_url, timeout=30) as resp:
+        result = json.loads(resp.read())
+
+    if result.get("status") != 1:
+        print(f"2captcha error: {result}")
+        cleanup(pw, browser, mode)
+        return
+
+    captcha_id = result["request"]
+    print(f"Waiting for solution (id: {captcha_id})...")
+
+    # Poll for solution
+    for attempt in range(60):
+        time.sleep(5)
+        check_url = f"http://2captcha.com/res.php?key={CAPTCHA_KEY}&action=get&id={captcha_id}&json=1"
+        with urllib.request.urlopen(check_url, timeout=10) as resp:
+            result = json.loads(resp.read())
+
+        if result.get("status") == 1:
+            token = result["request"]
+            print(f"Solved! Injecting token...")
+
+            # Inject the solution
+            page.evaluate(f"""() => {{
+                const textarea = document.querySelector('#g-recaptcha-response, [name="g-recaptcha-response"]');
+                if (textarea) {{
+                    textarea.style.display = 'block';
+                    textarea.value = '{token}';
+                }}
+                if (typeof ___grecaptcha_cfg !== 'undefined') {{
+                    Object.entries(___grecaptcha_cfg.clients).forEach(([k,v]) => {{
+                        if (v.Ka && v.Ka.callback) v.Ka.callback('{token}');
+                        else if (v.UO && v.UO.callback) v.UO.callback('{token}');
+                    }});
+                }}
+            }}""")
+            print("CAPTCHA solved and injected")
+            cleanup(pw, browser, mode)
+            return
+
+        if "CAPCHA_NOT_READY" not in str(result.get("request", "")):
+            print(f"2captcha error: {result}")
+            cleanup(pw, browser, mode)
+            return
+
+        print(f"  waiting... ({(attempt+1)*5}s)")
+
+    print("Timeout waiting for CAPTCHA solution")
+    cleanup(pw, browser, mode)
 
 # --- Autonomous Agent ---
 
@@ -151,9 +324,10 @@ def call_gemini(prompt, screenshot_b64=None):
         print("Error: set GEMINI_API_KEY or GOOGLE_API_KEY", file=sys.stderr)
         sys.exit(1)
 
-    parts = [{"text": prompt}]
+    parts = []
     if screenshot_b64:
         parts.append({"inline_data": {"mime_type": "image/png", "data": screenshot_b64}})
+    parts.append({"text": prompt})
 
     body = json.dumps({
         "contents": [{"parts": parts}],
@@ -166,7 +340,7 @@ def call_gemini(prompt, screenshot_b64=None):
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         result = json.loads(resp.read())
 
     return result["candidates"][0]["content"]["parts"][0]["text"]
@@ -191,33 +365,53 @@ def cmd_task(goal, max_steps=30):
     print(f"mode: {mode}")
     print(f"task: {goal}")
     print(f"max_steps: {max_steps}")
+    print(f"tabs: {len(ctx.pages)}")
     print()
 
     history = []
+    consecutive_errors = 0
 
     for step in range(1, max_steps + 1):
-        # Get page state
-        elements = get_elements(page)
-        url = page.url
-        title = page.title()
-        text_content = page.evaluate("() => document.body.innerText").strip()[:2000]
+        # Refresh current page reference (may have changed after tab switch/new tab)
+        page = ctx.pages[-1] if ctx.pages else page
 
-        # Take screenshot
+        # Get page state
+        try:
+            elements = get_elements(page)
+            url = page.url
+            title = page.title()
+            text_content = page.evaluate("() => document.body.innerText").strip()[:2000]
+        except Exception as e:
+            print(f"[step {step}] page read error: {e}")
+            history.append(f"Step {step}: page read error - {e}")
+            consecutive_errors += 1
+            if consecutive_errors >= 3:
+                print("\n3 consecutive errors. Stopping.")
+                break
+            continue
+
+        # Take screenshot (vision)
         shot_path = os.path.join(tempfile.gettempdir(), "browse-agent-shot.png")
+        shot_b64 = None
         try:
             page.screenshot(path=shot_path, timeout=10000)
             with open(shot_path, "rb") as f:
                 shot_b64 = base64.b64encode(f.read()).decode()
         except Exception:
-            shot_b64 = None
+            pass
 
-        state_text = f"URL: {url}\nTitle: {title}\n\nElements:\n" + "\n".join(elements[:50])
+        # Tab info
+        tabs_info = "\n".join(f"  tab[{i}]: {p.url}" for i, p in enumerate(ctx.pages))
+
+        state_text = f"URL: {url}\nTitle: {title}\nTabs:\n{tabs_info}\n\nElements:\n" + "\n".join(elements[:60])
         if text_content:
-            state_text += f"\n\nPage text (first 2000 chars):\n{text_content}"
+            state_text += f"\n\nVisible text (first 2000 chars):\n{text_content}"
 
         history_text = "\n".join(history[-10:]) if history else "No actions yet."
 
         prompt = f"""You are a browser automation agent. Complete this task: {goal}
+
+I'm also showing you a screenshot of the current page. Use BOTH the screenshot and the element list to decide your action. The screenshot shows visual layout, images, and content that may not be in the element list.
 
 Current page state:
 {state_text}
@@ -229,32 +423,45 @@ Respond with exactly ONE action in this format:
 ACTION: <action_type> <params>
 
 Available actions:
-- ACTION: click <index>          (click element by index from Elements list)
-- ACTION: input <index> <text>   (clear field at index and type text)
-- ACTION: navigate <url>         (go to URL)
-- ACTION: scroll down             (scroll down)
-- ACTION: scroll up               (scroll up)
-- ACTION: wait                    (wait 2 seconds for page to load)
-- ACTION: done <result>           (task complete, explain what was accomplished)
-- ACTION: fail <reason>           (task cannot be completed, explain why)
+- ACTION: click <index>            (click element by index)
+- ACTION: input <index> <text>     (clear field at index and type text)
+- ACTION: select <index> <value>   (select dropdown option)
+- ACTION: navigate <url>           (go to URL)
+- ACTION: scroll down              (scroll down)
+- ACTION: scroll up                (scroll up)
+- ACTION: newtab <url>             (open URL in new tab)
+- ACTION: tab <index>              (switch to tab by index)
+- ACTION: closetab                 (close current tab)
+- ACTION: wait                     (wait 2 seconds)
+- ACTION: done <result>            (task complete, state what was accomplished)
+- ACTION: fail <reason>            (task impossible, explain why)
 
 Rules:
-- Use element indices from the Elements list above
-- For forms: input into the field first, then click the submit button
-- One action per response, no explanation, just the ACTION line"""
+- Use element indices from the Elements list
+- For forms: input into each field, then click submit
+- If a page hasn't loaded, use wait
+- If stuck after 3 attempts, try a different approach
+- One action per response, just the ACTION line"""
 
         print(f"[step {step}] thinking...", end=" ", flush=True)
         try:
-            response = call_gemini(prompt, shot_b64)
+            response = with_retry(lambda: call_gemini(prompt, shot_b64), retries=1, delay=2)
         except Exception as e:
             print(f"LLM error: {e}")
-            break
+            consecutive_errors += 1
+            if consecutive_errors >= 3:
+                print("\n3 consecutive LLM errors. Stopping.")
+                break
+            history.append(f"Step {step}: LLM error")
+            continue
+
+        consecutive_errors = 0
 
         # Parse action
         action_match = re.search(r'ACTION:\s*(.+)', response.strip())
         if not action_match:
-            print(f"no action parsed from: {response[:100]}")
-            history.append(f"Step {step}: failed to parse action")
+            print(f"no action parsed: {response[:80]}")
+            history.append(f"Step {step}: parse error")
             continue
 
         action_line = action_match.group(1).strip()
@@ -264,7 +471,7 @@ Rules:
             if action_line.startswith("click "):
                 idx = int(action_line.split()[1])
                 page.evaluate(f"""() => {{
-                    const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+                    const els = document.querySelectorAll('{ELEMENT_SELECTOR}');
                     if (els[{idx}]) els[{idx}].click();
                 }}""")
                 page.wait_for_timeout(1500)
@@ -275,7 +482,7 @@ Rules:
                 idx = int(parts[1])
                 text = parts[2] if len(parts) > 2 else ""
                 page.evaluate(f"""() => {{
-                    const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
+                    const els = document.querySelectorAll('{ELEMENT_SELECTOR}');
                     const el = els[{idx}];
                     if (el) {{ el.focus(); el.value = ''; }}
                 }}""")
@@ -283,15 +490,49 @@ Rules:
                 page.wait_for_timeout(500)
                 history.append(f"Step {step}: input [{idx}] '{text}'")
 
+            elif action_line.startswith("select "):
+                parts = action_line.split(maxsplit=2)
+                idx = int(parts[1])
+                val = parts[2] if len(parts) > 2 else ""
+                page.evaluate(f"""() => {{
+                    const els = document.querySelectorAll('{ELEMENT_SELECTOR}');
+                    const el = els[{idx}];
+                    if (el && el.tagName === 'SELECT') {{
+                        el.value = '{val}';
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                }}""")
+                history.append(f"Step {step}: selected [{idx}] '{val}'")
+
             elif action_line.startswith("navigate "):
-                url = action_line.split(maxsplit=1)[1]
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                nav_url = action_line.split(maxsplit=1)[1]
+                with_retry(lambda: page.goto(nav_url, wait_until="domcontentloaded", timeout=30000))
                 page.wait_for_timeout(1000)
-                history.append(f"Step {step}: navigated to {url}")
+                history.append(f"Step {step}: navigated to {nav_url}")
+
+            elif action_line.startswith("newtab "):
+                tab_url = action_line.split(maxsplit=1)[1]
+                new_page = ctx.new_page()
+                with_retry(lambda: new_page.goto(tab_url, wait_until="domcontentloaded", timeout=30000))
+                page = new_page
+                history.append(f"Step {step}: new tab {tab_url}")
+
+            elif action_line.startswith("tab "):
+                tab_idx = int(action_line.split()[1])
+                if tab_idx < len(ctx.pages):
+                    page = ctx.pages[tab_idx]
+                    page.bring_to_front()
+                    history.append(f"Step {step}: switched to tab [{tab_idx}]")
+
+            elif action_line.startswith("closetab"):
+                if len(ctx.pages) > 1:
+                    page.close()
+                    page = ctx.pages[-1]
+                    history.append(f"Step {step}: closed tab")
 
             elif action_line.startswith("scroll "):
                 direction = action_line.split()[1]
-                page.evaluate(f"window.scrollBy(0, {'500' if direction == 'down' else '-500'})")
+                page.evaluate(f"window.scrollBy(0, {'600' if direction == 'down' else '-600'})")
                 page.wait_for_timeout(500)
                 history.append(f"Step {step}: scrolled {direction}")
 
@@ -314,7 +555,7 @@ Rules:
                 history.append(f"Step {step}: unknown action")
 
         except Exception as e:
-            print(f"  action error: {e}")
+            print(f"  error: {e}")
             history.append(f"Step {step}: error - {e}")
 
     else:
@@ -323,39 +564,46 @@ Rules:
     if mode != "cdp": browser.close()
     pw.stop()
 
+# --- Main ---
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h"):
         print(__doc__)
         sys.exit(0)
     if sys.argv[1] == "--version":
-        print("browse 2.0.0")
+        print("browse 3.0.0")
         sys.exit(0)
 
     cmd = sys.argv[1]
     try:
-        if cmd == "open" and len(sys.argv) > 2:
-            cmd_open(sys.argv[2])
-        elif cmd == "state":
-            cmd_state()
-        elif cmd == "click" and len(sys.argv) > 2:
-            cmd_click(int(sys.argv[2]))
-        elif cmd == "input" and len(sys.argv) > 3:
-            cmd_input(int(sys.argv[2]), " ".join(sys.argv[3:]))
-        elif cmd == "type" and len(sys.argv) > 2:
-            cmd_type(" ".join(sys.argv[2:]))
-        elif cmd == "screenshot":
-            cmd_screenshot(sys.argv[2] if len(sys.argv) > 2 else None)
-        elif cmd == "extract":
-            cmd_extract()
+        if cmd == "open" and len(sys.argv) > 2:          cmd_open(sys.argv[2])
+        elif cmd == "state":                               cmd_state()
+        elif cmd == "click" and len(sys.argv) > 2:        cmd_click(int(sys.argv[2]))
+        elif cmd == "input" and len(sys.argv) > 3:        cmd_input(int(sys.argv[2]), " ".join(sys.argv[3:]))
+        elif cmd == "select" and len(sys.argv) > 3:       cmd_select(int(sys.argv[2]), " ".join(sys.argv[3:]))
+        elif cmd == "type" and len(sys.argv) > 2:         cmd_type(" ".join(sys.argv[2:]))
+        elif cmd == "screenshot":                          cmd_screenshot(sys.argv[2] if len(sys.argv) > 2 else None)
+        elif cmd == "extract":                             cmd_extract()
+        elif cmd == "tabs":                                cmd_tabs()
+        elif cmd == "tab" and len(sys.argv) > 2:          cmd_tab(int(sys.argv[2]))
+        elif cmd == "newtab" and len(sys.argv) > 2:       cmd_newtab(sys.argv[2])
+        elif cmd == "closetab":                            cmd_closetab(int(sys.argv[2]) if len(sys.argv) > 2 else None)
+        elif cmd == "cookies":
+            sub = sys.argv[2] if len(sys.argv) > 2 else "save"
+            path = sys.argv[3] if len(sys.argv) > 3 else None
+            if sub == "save": cmd_cookies_save(path)
+            elif sub == "load": cmd_cookies_load(path)
+            else: print(f"Usage: browse cookies save|load [file]", file=sys.stderr)
+        elif cmd == "solve":                               cmd_solve()
         elif cmd == "task" and len(sys.argv) > 2:
             max_steps = 30
-            if "--max-steps" in sys.argv:
-                idx = sys.argv.index("--max-steps")
-                max_steps = int(sys.argv[idx + 1])
-                sys.argv.pop(idx); sys.argv.pop(idx)
-            cmd_task(" ".join(sys.argv[2:]), max_steps)
-        elif cmd == "close":
-            cmd_close()
+            args = sys.argv[2:]
+            if "--max-steps" in args:
+                idx = args.index("--max-steps")
+                max_steps = int(args[idx + 1])
+                args.pop(idx); args.pop(idx)
+            cmd_task(" ".join(args), max_steps)
+        elif cmd == "close":                               cmd_close()
         else:
             print(f"Unknown command: {cmd}", file=sys.stderr)
             print(__doc__)
