@@ -1,18 +1,19 @@
 # browse
 
-Browser automation CLI with autonomous agent mode. One Python script, connects to existing Chrome via CDP or launches headless Chromium.
+Browser automation CLI with autonomous agent, multi-tab, cookies, and CAPTCHA solving. One Python script, connects to existing Chrome via CDP or launches headless browser.
 
 ```
-$ browse task "Go to hacker news and tell me the top story"
+$ browse task "Go to google.com and search for weather in Berlin"
 
 mode: cdp
-task: Go to hacker news and tell me the top story
+task: Go to google.com and search for weather in Berlin
 max_steps: 30
 
-[step 1] thinking... navigate https://news.ycombinator.com
-[step 2] thinking... done The top story is "PC Gamer recommends RSS readers"
+[step 1] thinking... input 5 weather in Berlin
+[step 2] thinking... click 9
+[step 3] thinking... done The current temperature in Berlin is 6 C.
 
-Task complete: The top story is "PC Gamer recommends RSS readers"
+Task complete: The current temperature in Berlin is 6 C.
 ```
 
 ## Install
@@ -22,58 +23,84 @@ curl -fsSL https://raw.githubusercontent.com/buildingopen/browse/main/browse -o 
 chmod +x ~/.local/bin/browse
 ```
 
-Requires: Python 3.8+, `playwright` (`pip install playwright && playwright install chromium`)
-
-For autonomous mode: set `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+Requires: Python 3.8+, `playwright` (`pip install playwright`)
 
 ## Commands
 
-```bash
-browse open <url>               # Navigate to URL
-browse state                    # Show clickable elements with indices
-browse click <index>            # Click element by index
-browse input <index> <text>     # Clear field and type into element
-browse type <text>              # Type into focused element
-browse screenshot [file]        # Take screenshot
-browse extract                  # Extract page text
-browse task "<goal>"            # Autonomous: AI completes the task
-browse close                    # Close browser
-```
+| Command | Description |
+|---------|-------------|
+| `browse open <url>` | Navigate to URL |
+| `browse state` | Show numbered clickable elements |
+| `browse click <n>` | Click element by index |
+| `browse input <n> <text>` | Clear field and type |
+| `browse select <n> <value>` | Select dropdown option |
+| `browse type <text>` | Type into focused element |
+| `browse screenshot [file]` | Take screenshot |
+| `browse extract` | Extract page text |
+| `browse tabs` | List all open tabs |
+| `browse tab <n>` | Switch to tab |
+| `browse newtab <url>` | Open URL in new tab |
+| `browse closetab [n]` | Close tab |
+| `browse cookies save [file]` | Save cookies to file |
+| `browse cookies load [file]` | Restore cookies |
+| `browse solve` | Solve CAPTCHA via 2captcha |
+| `browse task "<goal>"` | Autonomous agent mode |
+| `browse close` | Close browser |
 
 ## Autonomous Agent
 
-Give it a goal in plain English:
+Give it a goal, it figures out what to click:
 
 ```bash
-browse task "Search Google for 'best coffee shops in Berlin'"
-browse task "Fill out the contact form on example.com with name John and email john@test.com"
+browse task "Search Google for flights from NYC to London"
+browse task "Fill out the signup form with name John and email john@test.com"
 browse task "Go to GitHub trending and list the top 3 repos" --max-steps 10
 ```
 
-The agent:
-1. Takes a screenshot + reads page elements
-2. Sends to Gemini: "here's the page, here's the goal, what action next?"
-3. Executes the action (click, type, navigate, scroll)
-4. Repeats until done or max steps reached
+The agent uses **vision + DOM**: sends both a screenshot and the element list to Gemini, so it understands visual layout, images, and dynamic content. Includes error recovery (retries on failures, stops after 3 consecutive errors).
 
-## How it connects
+## Multi-Tab
 
-1. Tries CDP connection (`BROWSE_CDP_URL`, default `http://localhost:9222`)
-2. Falls back to launching headless Chromium
+```bash
+browse newtab https://example.com    # Open in new tab
+browse tabs                          # List tabs with indices
+browse tab 2                         # Switch to tab
+browse closetab 0                    # Close tab
+```
 
-On a server with Chrome already running (e.g., via `google-chrome --remote-debugging-port=9222`), it connects automatically. No new browser launched.
+## Cookie Persistence
 
-## Environment variables
+```bash
+browse cookies save                  # Save to default file
+browse cookies save ~/my-cookies.json
+browse cookies load                  # Restore cookies
+```
+
+## CAPTCHA Solving
+
+```bash
+export TWOCAPTCHA_KEY=your_key
+browse solve                         # Solve reCAPTCHA/hCaptcha on current page
+```
+
+Detects reCAPTCHA and hCaptcha via `data-sitekey`, submits to 2captcha, polls for solution, injects the token.
+
+## Connection
+
+Tries CDP first (`BROWSE_CDP_URL`, default `http://localhost:9222`), falls back to headless browser. On a server with Chrome running, it connects automatically.
+
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BROWSE_CDP_URL` | `http://localhost:9222` | CDP endpoint for existing Chrome |
-| `GEMINI_API_KEY` | - | Required for `task` command |
+| `BROWSE_CDP_URL` | `http://localhost:9222` | CDP endpoint |
+| `GEMINI_API_KEY` | - | For autonomous agent |
 | `GOOGLE_API_KEY` | - | Alternative to GEMINI_API_KEY |
+| `TWOCAPTCHA_KEY` | - | For CAPTCHA solving |
 
 ## Why
 
-[browser-use](https://github.com/browser-use/browser-use) (82k stars) has the same concept but its `BrowserSession` watchdog layer [fails on headless Linux](https://github.com/browser-use/browser-use/issues/4471) (timeout on launch, WebSocket reconnection loop on CDP). This script uses Playwright directly, skipping the broken layer.
+[browser-use](https://github.com/browser-use/browser-use) (82k stars) has the same concept but its BrowserSession watchdog layer [fails on headless Linux](https://github.com/browser-use/browser-use/issues/4471). browse uses Playwright directly.
 
 ## License
 
